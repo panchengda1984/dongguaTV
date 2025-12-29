@@ -75,6 +75,171 @@ const PROXY_MEMORY_TTL = 24 * 60 * 60 * 1000; // 24小时后重新尝试直连
 const SLOW_THRESHOLD_MS = 1500; // 直连延迟超过此值视为慢速，尝试代理
 
 /**
+ * 检测字符串是否主要包含英文字符（用于判断是否需要翻译）
+ * @param {string} text - 待检测文本
+ * @returns {boolean} - 是否主要是英文
+ */
+function isMainlyEnglish(text) {
+    if (!text) return false;
+    // 去除空格和标点后检测
+    const cleaned = text.replace(/[\s\d\-\_\:\.\,\!\?\'\"\(\)\[\]]/g, '');
+    if (cleaned.length === 0) return false;
+
+    // 计算英文字母占比
+    const englishChars = (cleaned.match(/[a-zA-Z]/g) || []).length;
+    const ratio = englishChars / cleaned.length;
+
+    // 如果英文字符占比超过 70%，认为是英文
+    return ratio > 0.7;
+}
+
+/**
+ * 通过 TMDB 搜索获取影片的中文名称
+ * 利用 TMDB 的多语言支持，查询英文标题对应的中文翻译
+ * @param {string} englishTitle - 英文标题
+ * @returns {Promise<string[]>} - 找到的中文标题数组
+ */
+async function fetchChineseTitleFromTMDB(englishTitle) {
+    const TMDB_API_KEY = process.env.TMDB_API_KEY;
+    if (!TMDB_API_KEY) return [];
+
+    try {
+        // 先用英文搜索找到影片 ID
+        const searchUrl = `https://api.themoviedb.org/3/search/multi?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(englishTitle)}&language=en-US`;
+        const searchResponse = await axios.get(searchUrl, { timeout: 5000 });
+
+        if (!searchResponse.data.results || searchResponse.data.results.length === 0) {
+            return [];
+        }
+
+        const firstResult = searchResponse.data.results[0];
+        const mediaType = firstResult.media_type;  // movie 或 tv
+        const id = firstResult.id;
+
+        if (!id || (mediaType !== 'movie' && mediaType !== 'tv')) {
+            return [];
+        }
+
+        // 用中文语言获取详情，TMDB 会返回中文标题
+        const detailUrl = `https://api.themoviedb.org/3/${mediaType}/${id}?api_key=${TMDB_API_KEY}&language=zh-CN`;
+        const detailResponse = await axios.get(detailUrl, { timeout: 5000 });
+
+        const chineseTitles = [];
+        const chineseTitle = detailResponse.data.title || detailResponse.data.name;
+
+        if (chineseTitle && chineseTitle !== englishTitle) {
+            chineseTitles.push(chineseTitle);
+            console.log(`[TMDB Translation] "${englishTitle}" => "${chineseTitle}"`);
+        }
+
+        // 尝试获取更多别名（alternative_titles）
+        try {
+            const altUrl = `https://api.themoviedb.org/3/${mediaType}/${id}/alternative_titles?api_key=${TMDB_API_KEY}`;
+            const altResponse = await axios.get(altUrl, { timeout: 3000 });
+
+            // 电影用 titles，电视剧用 results
+            const alternatives = altResponse.data.titles || altResponse.data.results || [];
+
+            // 查找中文地区的别名 (CN, TW, HK)
+            for (const alt of alternatives) {
+                const country = alt.iso_3166_1;
+                if (['CN', 'TW', 'HK'].includes(country) && alt.title) {
+                    if (!chineseTitles.includes(alt.title) && alt.title !== englishTitle) {
+                        chineseTitles.push(alt.title);
+                    }
+                }
+            }
+        } catch (e) {
+            // 别名获取失败不影响主流程
+        }
+
+        return chineseTitles;
+    } catch (error) {
+        console.error(`[TMDB Translation Error] ${englishTitle}:`, error.message);
+        return [];
+    }
+}
+
+/**
+ * 智能生成搜索关键词变体
+ * 用于提高搜索命中率，解决 TMDB 标题与资源站标题不匹配的问题
+ * 例如："利刃出鞘3：亡者归来" -> ["利刃出鞘3：亡者归来", "利刃出鞘3", "利刃出鞘"]
+ * @param {string} keyword - 原始搜索关键词
+ * @param {string} originalTitle - 可选的原始标题（如英文名）
+ * @returns {string[]} - 关键词变体数组（已去重）
+ */
+function generateSearchKeywords(keyword, originalTitle = '') {
+    const keywords = new Set();
+
+    if (!keyword) return [];
+
+    // 1. 原始关键词
+    keywords.add(keyword.trim());
+
+    // 2. 如果有原始标题（英文名），也加入
+    if (originalTitle && originalTitle.trim() && originalTitle !== keyword) {
+        keywords.add(originalTitle.trim());
+    }
+
+    // 3. 去除常见分隔符后的主标题
+    // 常见分隔符：：、:、-、—、·、|、/
+    const separators = ['：', ':', '–', '—', '-', '·', '|', '/', '~'];
+    for (const sep of separators) {
+        if (keyword.includes(sep)) {
+            const mainTitle = keyword.split(sep)[0].trim();
+            if (mainTitle && mainTitle.length >= 2) {
+                keywords.add(mainTitle);
+            }
+        }
+    }
+
+    // 4. 去除括号内容：《》、()、（）、【】、[]
+    const bracketPatterns = [
+        /《[^》]*》/g,
+        /\([^)]*\)/g,
+        /（[^）]*）/g,
+        /\[[^\]]*\]/g,
+        /【[^】]*】/g
+    ];
+    let cleanedKeyword = keyword;
+    for (const pattern of bracketPatterns) {
+        cleanedKeyword = cleanedKeyword.replace(pattern, '').trim();
+    }
+    if (cleanedKeyword && cleanedKeyword !== keyword && cleanedKeyword.length >= 2) {
+        keywords.add(cleanedKeyword);
+    }
+
+    // 5. 对于带数字续集的影片，尝试只保留数字前面的部分
+    // 例如："利刃出鞘3" -> "利刃出鞘"  (但不移除如 "007" 这样的数字标题)
+    const numericMatch = keyword.match(/^(.+?)\d+$/);
+    if (numericMatch && numericMatch[1] && numericMatch[1].length >= 2) {
+        // 只有当前面有足够长的标题时才添加
+        const baseTitle = numericMatch[1].trim();
+        if (baseTitle.length >= 2) {
+            keywords.add(baseTitle);
+        }
+    }
+
+    // 6. 去除 "第X季"、"第X部"、"Season X" 等后缀
+    const seasonPatterns = [
+        /第[一二三四五六七八九十\d]+季$/,
+        /第[一二三四五六七八九十\d]+部$/,
+        /Season\s*\d+$/i,
+        /S\d+$/i
+    ];
+    let noSeasonKeyword = keyword;
+    for (const pattern of seasonPatterns) {
+        noSeasonKeyword = noSeasonKeyword.replace(pattern, '').trim();
+    }
+    if (noSeasonKeyword && noSeasonKeyword !== keyword && noSeasonKeyword.length >= 2) {
+        keywords.add(noSeasonKeyword);
+    }
+
+    return Array.from(keywords);
+}
+
+
+/**
  * 检查站点是否需要使用代理（未过期）
  */
 function shouldUseProxy(siteKey) {
@@ -666,9 +831,12 @@ app.get('/api/sites', async (req, res) => {
 });
 
 // 2. 搜索 API - SSE 流式版本 (GET, 用于实时搜索)
+// 支持智能多关键词搜索：自动生成关键词变体提高搜索命中率
 app.get('/api/search', async (req, res) => {
     const keyword = req.query.wd;
+    const originalTitle = req.query.original || '';  // 可选：原始标题（如英文名）
     const stream = req.query.stream === 'true';
+    const smartSearch = req.query.smart !== 'false';  // 默认启用智能搜索
 
     if (!keyword) {
         return res.status(400).json({ error: 'Missing keyword' });
@@ -687,63 +855,119 @@ app.get('/api/search', async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no'); // 禁用 Nginx 缓冲
 
+    // 生成搜索关键词变体
+    let searchKeywords = smartSearch
+        ? generateSearchKeywords(keyword, originalTitle)
+        : [keyword];
+
+    // 智能翻译：如果关键词是英文，尝试通过 TMDB 获取中文名
+    if (smartSearch && isMainlyEnglish(keyword)) {
+        console.log(`[Smart Search] 检测到英文关键词，尝试获取中文翻译: ${keyword}`);
+        const chineseTitles = await fetchChineseTitleFromTMDB(keyword);
+        if (chineseTitles.length > 0) {
+            // 将中文标题加入搜索列表，并对中文标题也生成变体
+            for (const cn of chineseTitles) {
+                const cnVariants = generateSearchKeywords(cn);
+                for (const v of cnVariants) {
+                    if (!searchKeywords.includes(v)) {
+                        searchKeywords.push(v);
+                    }
+                }
+            }
+        }
+    }
+
+    if (searchKeywords.length > 1) {
+        console.log(`[Smart Search] 生成关键词变体: ${searchKeywords.join(' | ')}`);
+    }
+
+    // 用于跟踪已发送的结果，避免重复
+    const sentVodIds = new Map(); // key: site_key_vod_id, value: true
+
     // 并行搜索所有站点
     const searchPromises = sites.map(async (site) => {
-        const cacheKey = `${site.key}_${keyword}`;
-        const cached = cacheManager.get('search', cacheKey);
+        // 对每个站点，尝试所有关键词变体
+        const allResults = [];
 
-        if (cached && cached.list) {
-            // 命中缓存，立即发送
-            const items = cached.list.map(item => ({
-                ...item,
-                site_key: site.key,
-                site_name: site.name
-            }));
-            if (items.length > 0) {
-                res.write(`data: ${JSON.stringify(items)}\n\n`);
+        for (const kw of searchKeywords) {
+            const cacheKey = `${site.key}_${kw}`;
+            const cached = cacheManager.get('search', cacheKey);
+
+            if (cached && cached.list) {
+                // 命中缓存
+                allResults.push(...cached.list);
+            } else {
+                try {
+                    // 只在第一个关键词时打印日志，避免日志刷屏
+                    if (kw === searchKeywords[0]) {
+                        console.log(`[SSE Search] ${site.name} -> ${searchKeywords.length > 1 ? searchKeywords.join(' | ') : kw}`);
+                    }
+
+                    // 构建请求 URL（带参数）
+                    const searchUrl = `${site.api}?ac=detail&wd=${encodeURIComponent(kw)}`;
+
+                    // 使用带代理回退的请求
+                    const { data, usedProxy } = await fetchWithProxyFallback(searchUrl, { timeout: 8000 }, site.key);
+
+                    if (usedProxy && kw === searchKeywords[0]) {
+                        console.log(`[SSE Search] ${site.name} 通过代理获取结果`);
+                    }
+
+                    const list = data.list ? data.list.map(item => ({
+                        vod_id: item.vod_id,
+                        vod_name: item.vod_name,
+                        vod_pic: item.vod_pic,
+                        vod_remarks: item.vod_remarks,
+                        vod_year: item.vod_year,
+                        type_name: item.type_name,
+                        vod_content: item.vod_content,
+                        vod_play_from: item.vod_play_from,
+                        vod_play_url: item.vod_play_url
+                    })) : [];
+
+                    // 缓存结果 (1小时)
+                    cacheManager.set('search', cacheKey, { list }, 3600);
+
+                    allResults.push(...list);
+                } catch (error) {
+                    // 单个关键词失败不影响其他
+                    if (kw === searchKeywords[0]) {
+                        console.error(`[SSE Search Error] ${site.name}:`, error.message);
+                    }
+                }
             }
-            return items;
         }
 
-        try {
-            console.log(`[SSE Search] ${site.name} -> ${keyword}`);
+        // 对该站点的结果去重（基于 vod_id）
+        const uniqueResults = [];
+        const seenIds = new Set();
 
-            // 构建请求 URL（带参数）
-            const searchUrl = `${site.api}?ac=detail&wd=${encodeURIComponent(keyword)}`;
-
-            // 使用带代理回退的请求
-            const { data, usedProxy } = await fetchWithProxyFallback(searchUrl, { timeout: 8000 }, site.key);
-
-            if (usedProxy) {
-                console.log(`[SSE Search] ${site.name} 通过代理获取结果`);
+        for (const item of allResults) {
+            if (!seenIds.has(item.vod_id)) {
+                seenIds.add(item.vod_id);
+                uniqueResults.push({
+                    ...item,
+                    site_key: site.key,
+                    site_name: site.name
+                });
             }
-
-            const list = data.list ? data.list.map(item => ({
-                vod_id: item.vod_id,
-                vod_name: item.vod_name,
-                vod_pic: item.vod_pic,
-                vod_remarks: item.vod_remarks,
-                vod_year: item.vod_year,
-                type_name: item.type_name,
-                vod_content: item.vod_content,
-                vod_play_from: item.vod_play_from,
-                vod_play_url: item.vod_play_url,
-                site_key: site.key,
-                site_name: site.name
-            })) : [];
-
-            // 缓存结果 (1小时)
-            cacheManager.set('search', cacheKey, { list }, 3600);
-
-            // 发送结果到客户端
-            if (list.length > 0) {
-                res.write(`data: ${JSON.stringify(list)}\n\n`);
-            }
-            return list;
-        } catch (error) {
-            console.error(`[SSE Search Error] ${site.name}:`, error.message);
-            return [];
         }
+
+        // 发送结果到客户端（检查全局去重）
+        const newItems = uniqueResults.filter(item => {
+            const globalKey = `${item.site_key}_${item.vod_id}`;
+            if (!sentVodIds.has(globalKey)) {
+                sentVodIds.set(globalKey, true);
+                return true;
+            }
+            return false;
+        });
+
+        if (newItems.length > 0) {
+            res.write(`data: ${JSON.stringify(newItems)}\n\n`);
+        }
+
+        return newItems;
     });
 
     // 等待所有搜索完成
@@ -753,6 +977,7 @@ app.get('/api/search', async (req, res) => {
     res.write('event: done\ndata: {}\n\n');
     res.end();
 });
+
 
 // 2b. 搜索 API - POST 版本 (用于单站点搜索)
 app.post('/api/search', async (req, res) => {

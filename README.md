@@ -2,6 +2,17 @@
 
 这是一个经过全面重构和升级的现代流媒体聚合播放器，基于 Node.js 和 Vue 3 构建。相比原版，本作引入了 Netflix 风格的沉浸式 UI、TMDb 数据驱动的动态榜单、以及智能的多源聚合搜索功能。
 
+# 演示网站
+
+https://ednovas-test.vercel.app （不包含任何数据）
+
+<img width="2547" height="1226" alt="image" src="https://github.com/user-attachments/assets/15392a90-9078-45b6-828d-829402669950" />
+
+<img width="2547" height="1227" alt="image" src="https://github.com/user-attachments/assets/d03543f5-34a4-414b-a131-62eda0af21b2" />
+
+<img width="2547" height="1229" alt="image" src="https://github.com/user-attachments/assets/e8bd4e14-dbd2-4d49-a1fc-7979c1ca22a4" />
+
+
 ---
 
 ## 📚 目录 (Table of Contents)
@@ -28,6 +39,8 @@
 
 ### 2. 🔍 智能搜索与聚合
 - **实时流式搜索 (SSE)**：采用 Server-Sent Events 技术，搜索结果**边搜边显**，即时反馈，无需等待所有源响应。
+- **智能关键词匹配**：自动生成搜索变体（去除副标题、季数后缀等），同时搜索中英文名，大幅提高命中率。
+- **自动英中翻译**：检测到英文搜索词时，自动通过 TMDB 获取中文译名并一起搜索（如搜索 "Stranger Things" 会自动添加 "怪奇物语"），无需外部翻译 API。
 - **自动分组与实时合并**：同一影片的不同线路自动聚合，新搜索到的源实时合并到已有卡片，右上角源数量实时跳动。
 - **SQLite 永久缓存**：内置高性能 SQLite 数据库缓存，支持无限存储，读写速度极快，热搜词秒级响应。
 
@@ -679,12 +692,12 @@ docker run -d -p 3000:3000 \
 4.  点击 **映射/绑定域名**，输入您的域名 (如 `movie.example.com`)。
 5.  访问域名即可使用。
 
-### 🤖 Android APP 构建 (GitHub Actions)
+#### 🤖 Android APP 构建 (GitHub Actions)
 
-本项目配置了自动化构建流程，您可以轻松编译自己的 Android 客户端。
+本项目配置了自动化构建流程。由于构建 APK 耗时较长，**默认仅在推送 Tag 时触发构建**，普通代码提交不会触发。
 
 1.  **Fork 本仓库** 到您的 GitHub 账号。
-2.  **提交 Tag**：
+2.  **提交 Tag (触发构建)**：
     每当您推送一个以 `v` 开头的 Tag (例如 `v1.0.0`) 到仓库时，GitHub Actions 会自动触发构建。
     ```bash
     git tag v1.0.0
@@ -753,7 +766,33 @@ docker run -d -p 3000:3000 \
     ```
     APK 位于 `android/app/build/outputs/apk/release/`
 
+#### 🏠 内网 HTTP 使用说明
+
+> **⚠️ 重要**：从 Android 9 (API 28) 开始，Android 默认禁止明文 HTTP 流量 (Cleartext Traffic)。如果您的 APK 无法连接 HTTP 服务器，请确认以下配置。
+
+**问题现象**：
+- APK 在 Android TV / 手机上一直显示 loading
+- 浏览器可以正常访问 `http://192.168.x.x:3000`，但 APP 不行
+- 控制台报错 `net::ERR_CLEARTEXT_NOT_PERMITTED`
+
+**解决方案**：
+
+本项目已内置 HTTP 支持配置。如果您使用 GitHub Actions 自动构建或本地构建，APK 会自动支持 HTTP 访问。
+
+**使用 GitHub Actions 构建内网 APK**：
+
+1. 进入 **Actions** → **Android Build & Release** → **Run workflow**
+2. 填写您的内网服务器地址：`http://192.168.1.100:3000`
+3. 构建完成后下载 APK，即可正常访问 HTTP 服务
+
+**📝 注意事项**：
+- `capacitor.config.json` 中的 `"cleartext": true` 是 Capacitor 配置，但 Android 9+ 还需要上述 Android 原生配置
+- 如果您手动构建 APK，请确保项目代码是最新版本（包含上述配置）
+- 建议使用固定 IP 地址而非主机名，避免 DNS 解析问题
+
 ---
+
+
 
 ## 💾 数据维护与备份
 
